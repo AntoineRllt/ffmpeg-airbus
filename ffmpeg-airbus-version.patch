@@ -1,0 +1,11 @@
+--- a/fftools/opt_common.c	2025-04-29 16:40:09.582180291 +0200
++++ b/fftools/opt_common.c	2025-04-29 17:50:59.747700068 +0200
+@@ -203,6 +203,8 @@
+         av_log(NULL, level, " Copyright (c) %d-%d the FFmpeg developers",
+                program_birth_year, CONFIG_THIS_YEAR);
+     av_log(NULL, level, "\n");
++    av_log(NULL, level, "=================== Patched by Airbus team ===================");
++    av_log(NULL, level, "\n");   
+     av_log(NULL, level, "%sbuilt with %s\n", indent, CC_IDENT);
+ 
+     av_log(NULL, level, "%sconfiguration: " FFMPEG_CONFIGURATION "\n", indent);
