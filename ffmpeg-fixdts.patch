@@ -1,0 +1,96 @@
+diff -Naur ffmpeg-5.1.2/fftools/ffmpeg.c ffmpeg-5.1.2-fixdatadts/fftools/ffmpeg.c
+--- ffmpeg-5.1.2/fftools/ffmpeg.c	2022-07-22 19:58:38.000000000 +0200
++++ ffmpeg-5.1.2-fixdatadts/fftools/ffmpeg.c	2023-03-24 08:45:33.849508056 +0100
+@@ -2368,6 +2368,8 @@
+     int eof_reached = 0;
+ 
+     AVPacket *avpkt = ist->pkt;
++            // av_log(NULL, AV_LOG_WARNING, "XXXX FFMPEG   process input packet " "stream %s \n", av_get_media_type_string(ist->dec_ctx->codec_type));
++            
+ 
+     if (!ist->saw_first_ts) {
+         ist->first_dts =
+@@ -2545,6 +2547,7 @@
+ 
+         do_streamcopy(ist, ost, pkt);
+     }
++            //av_log(NULL, AV_LOG_WARNING, "XXXX FFMPEG   process input packet done " "stream %s \n\n", av_get_media_type_string(ist->dec_ctx->codec_type));
+ 
+     return !eof_reached;
+ }
+@@ -4104,6 +4107,8 @@
+     if (pkt->dts != AV_NOPTS_VALUE)
+         pkt->dts += duration;
+ 
++            //av_log(NULL, AV_LOG_WARNING, "XXXX FFMPEG %s input packet " " dts %d pts %d, next dts %d \n", av_get_media_type_string(ist->dec_ctx->codec_type), pkt->dts, pkt->pts, ist->next_dts);
++
+     pkt_dts = av_rescale_q_rnd(pkt->dts, ist->st->time_base, AV_TIME_BASE_Q, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+ 
+     if (copy_ts && pkt_dts != AV_NOPTS_VALUE && ist->next_dts != AV_NOPTS_VALUE &&
+@@ -4153,8 +4158,29 @@
+         }
+     }
+ 
+-    if (pkt->dts != AV_NOPTS_VALUE)
++    // fix data stream dts/pts
++    if (pkt->dts != AV_NOPTS_VALUE && ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
++        // keep the video dts for further use
++        ifile->last_video_dts = pkt->dts;
++    }
++    if (pkt->dts == AV_NOPTS_VALUE && ist->dec_ctx->codec_type == AVMEDIA_TYPE_DATA) {
++        // that value of last_video_dts may be AV_NOPTS_VALUE if there is no video packet yet
++        if (ifile->last_video_dts == AV_NOPTS_VALUE) {
++            if (debug_ts) {
++                av_log(NULL, AV_LOG_INFO, "demuxer+ffmpeg -> unable to fix missing data pts/dts, missing a video dts, the data packet is dropped\n");
++            }
++            goto discard_packet;
++        }
++        pkt->dts = ifile->last_video_dts;
++        pkt->pts = pkt->dts;
++        if (debug_ts) {
++            av_log(NULL, AV_LOG_INFO, "demuxer+ffmpeg -> fix missing data pts/dts to last video dts: %d\n", pkt->dts);
++        }
++    }
++
++    if (pkt->dts != AV_NOPTS_VALUE) {
+         ifile->last_ts = av_rescale_q(pkt->dts, ist->st->time_base, AV_TIME_BASE_Q);
++    }
+ 
+     if (debug_ts) {
+         av_log(NULL, AV_LOG_INFO, "demuxer+ffmpeg -> ist_index:%d type:%s pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s duration:%s duration_time:%s off:%s off_time:%s\n",
+diff -Naur ffmpeg-5.1.2/fftools/ffmpeg.h ffmpeg-5.1.2-fixdatadts/fftools/ffmpeg.h
+--- ffmpeg-5.1.2/fftools/ffmpeg.h	2022-07-22 19:58:38.000000000 +0200
++++ ffmpeg-5.1.2-fixdatadts/fftools/ffmpeg.h	2023-03-24 08:45:38.524654388 +0100
+@@ -415,6 +415,7 @@
+ 
+     int64_t ts_offset;
+     int64_t last_ts;
++    int64_t last_video_dts;
+     int64_t start_time;   /* user-specified start time in AV_TIME_BASE or AV_NOPTS_VALUE */
+     int64_t recording_time;
+     int nb_streams;       /* number of stream that ffmpeg is aware of; may be different
+diff -Naur ffmpeg-5.1.2/fftools/opt_common.c ffmpeg-5.1.2-fixdatadts/fftools/opt_common.c
+--- ffmpeg-5.1.2/fftools/opt_common.c	2022-07-22 19:58:38.000000000 +0200
++++ ffmpeg-5.1.2-fixdatadts/fftools/opt_common.c	2023-03-30 16:56:51.809500475 +0200
+@@ -203,6 +203,7 @@
+         av_log(NULL, level, " Copyright (c) %d-%d the FFmpeg developers",
+                program_birth_year, CONFIG_THIS_YEAR);
+     av_log(NULL, level, "\n");
++    av_log(NULL, level, "%spatched by Airbus\n", indent);
+     av_log(NULL, level, "%sbuilt with %s\n", indent, CC_IDENT);
+ 
+     av_log(NULL, level, "%sconfiguration: " FFMPEG_CONFIGURATION "\n", indent);
+diff -Naur ffmpeg-5.1.2/libavformat/version_major.h ffmpeg-5.1.2-fixdatadts/libavformat/version_major.h
+--- ffmpeg-5.1.2/libavformat/version_major.h	2022-07-22 19:58:39.000000000 +0200
++++ ffmpeg-5.1.2-fixdatadts/libavformat/version_major.h	2023-03-30 15:35:10.073075297 +0200
+@@ -42,7 +42,8 @@
+  *
+  */
+ #define FF_API_LAVF_PRIV_OPT            (LIBAVFORMAT_VERSION_MAJOR < 60)
+-#define FF_API_COMPUTE_PKT_FIELDS2      (LIBAVFORMAT_VERSION_MAJOR < 60)
++//define FF_API_COMPUTE_PKT_FIELDS2      (LIBAVFORMAT_VERSION_MAJOR < 60)
++#define FF_API_COMPUTE_PKT_FIELDS2      0
+ #define FF_API_AVIOCONTEXT_WRITTEN      (LIBAVFORMAT_VERSION_MAJOR < 60)
+ #define FF_HLS_TS_OPTIONS               (LIBAVFORMAT_VERSION_MAJOR < 60)
+ #define FF_API_AVSTREAM_CLASS           (LIBAVFORMAT_VERSION_MAJOR > 59)
+
