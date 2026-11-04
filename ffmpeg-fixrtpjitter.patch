@@ -1,0 +1,272 @@
+diff --git a/doc/Makefile b/doc/Makefile
+index 67586e4..4446805 100644
+--- a/doc/Makefile
++++ b/doc/Makefile
+@@ -59,7 +59,11 @@ GENTEXI  = format codec
+ GENTEXI := $(GENTEXI:%=doc/avoptions_%.texi)
+ 
+ $(GENTEXI): TAG = GENTEXI
+-$(GENTEXI): doc/avoptions_%.texi: doc/print_options$(HOSTEXESUF)
++
++doc/print_options: doc/print_options.c
++	gcc -o doc/print_options doc/print_options.c -I .
++
++$(GENTEXI): doc/avoptions_%.texi: doc/print_options
+ 	$(M)doc/print_options$(HOSTEXESUF) $* > $@
+ 
+ doc/%.html: TAG = HTML
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index 630204a..a5da11c 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -802,12 +802,12 @@ static int prepare_input_packet(AVFormatContext *s, AVStream *st, AVPacket *pkt)
+ 
+         /* when there is no reordering (so dts is equal to pts), but
+          * only one of them is set, set the other as well */
+-        if (!sti->reorder) {
++        //if (!sti->reorder) {
+             if (pkt->pts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE)
+                 pkt->pts = pkt->dts;
+             if (pkt->dts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
+                 pkt->dts = pkt->pts;
+-        }
++        //}
+ 
+         /* check that the timestamps are set */
+         if (pkt->pts == AV_NOPTS_VALUE || pkt->dts == AV_NOPTS_VALUE) {
+diff --git a/libavformat/rtpdec.c b/libavformat/rtpdec.c
+index fa7544c..40b2461 100644
+--- a/libavformat/rtpdec.c
++++ b/libavformat/rtpdec.c
+@@ -822,6 +822,11 @@ static int has_next_packet(RTPDemuxContext *s)
+     return s->queue && s->queue->seq == (uint16_t) (s->seq + 1);
+ }
+ 
++static int has_next_packet_buffer(RTPDemuxContext *s)
++{
++    return s->queue && s->queue->seq == (uint16_t) (s->seq + 1) && s->queue_len > s->queue_min;
++}
++
+ int64_t ff_rtp_queued_packet_time(RTPDemuxContext *s)
+ {
+     return s->queue ? s->queue->recvtime : 0;
+@@ -840,8 +845,14 @@ static int rtp_parse_queued_packet(RTPDemuxContext *s, AVPacket *pkt)
+ 
+         if (pkt_missed < 0)
+             pkt_missed += UINT16_MAX;
+-        av_log(s->ic, AV_LOG_WARNING,
++        if (s->queue_min < s->queue_size - 2 && s->ic->max_delay < s->jitter_max) {
++            s->queue_min += 2;
++            av_log(s->ic, AV_LOG_WARNING,
++               "RTP: missed %d packets, minimum queue size set to %d\n", pkt_missed, s->queue_min);
++        } else {
++            av_log(s->ic, AV_LOG_WARNING,
+                "RTP: missed %d packets\n", pkt_missed);
++        }
+     }
+ 
+     /* Parse the first packet in the queue, and dequeue it */
+@@ -900,36 +911,20 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
+         rtcp_update_jitter(&s->statistics, timestamp, arrival_ts);
+     }
+ 
+-    if ((s->seq == 0 && !s->queue) || s->queue_size <= 1) {
+-        /* First packet, or no reordering */
+-        return rtp_parse_packet_internal(s, pkt, buf, len);
+-    } else {
+-        uint16_t seq = AV_RB16(buf + 2);
+-        int16_t diff = seq - s->seq;
+-        if (diff < 0) {
+-            /* Packet older than the previously emitted one, drop */
+-            av_log(s->ic, AV_LOG_WARNING,
+-                   "RTP: dropping old packet received too late\n");
+-            return -1;
+-        } else if (diff <= 1) {
+-            /* Correct packet */
+-            rv = rtp_parse_packet_internal(s, pkt, buf, len);
+-            return rv;
+-        } else {
+-            /* Still missing some packet, enqueue this one. */
+-            rv = enqueue_packet(s, buf, len);
+-            if (rv < 0)
+-                return rv;
+-            *bufptr = NULL;
+-            /* Return the first enqueued packet if the queue is full,
+-             * even if we're missing something */
+-            if (s->queue_len >= s->queue_size) {
+-                av_log(s->ic, AV_LOG_WARNING, "jitter buffer full\n");
+-                return rtp_parse_queued_packet(s, pkt);
+-            }
+-            return -1;
+-        }
++    /* Fill the jitter queue. */
++    rv = enqueue_packet(s, buf, len);
++    if (rv < 0)
++        return rv;
++
++    /* ask for the next packet */
++    *bufptr = NULL;
++
++    /* Return the first enqueued packet if the queue is ready,
++     * even if we're missing something */
++    if (s->queue && s->queue_len > s->queue_min) {
++        return rtp_parse_queued_packet(s, pkt);
+     }
++    return -1;
+ }
+ 
+ /**
+@@ -949,9 +944,9 @@ int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
+         return -1;
+     rv = rtp_parse_one_packet(s, pkt, bufptr, len);
+     s->prev_ret = rv;
+-    while (rv < 0 && has_next_packet(s))
++    while (rv < 0 && has_next_packet_buffer(s))
+         rv = rtp_parse_queued_packet(s, pkt);
+-    return rv ? rv : has_next_packet(s);
++    return rv ? rv : has_next_packet_buffer(s);
+ }
+ 
+ void ff_rtp_parse_close(RTPDemuxContext *s)
+diff --git a/libavformat/rtpdec.h b/libavformat/rtpdec.h
+index 5a02e72..8278fef 100644
+--- a/libavformat/rtpdec.h
++++ b/libavformat/rtpdec.h
+@@ -169,7 +169,9 @@ struct RTPDemuxContext {
+     int prev_ret;     ///< The return value of the actual parsing of the previous packet
+     RTPPacket* queue; ///< A sorted queue of buffered packets not yet returned
+     int queue_len;    ///< The number of packets in queue
++    int queue_min;    ///< The minimum size of queue, or 0 if reordering is disabled
+     int queue_size;   ///< The size of queue, or 0 if reordering is disabled
++    int jitter_max;   ///< The max jitter delay, until the max is reached, the queue_min may be increased
+     /*@}*/
+ 
+     /* rtcp sender statistics receive */
+diff --git a/libavformat/rtpproto.c b/libavformat/rtpproto.c
+index cac3610..1b833e4 100644
+--- a/libavformat/rtpproto.c
++++ b/libavformat/rtpproto.c
+@@ -55,6 +55,7 @@ typedef struct RTPContext {
+     int rtcp_port, local_rtpport, local_rtcpport;
+     int connect;
+     int pkt_size;
++    int reuse_socket;
+     int dscp;
+     char *sources;
+     char *block;
+@@ -75,6 +76,7 @@ static const AVOption options[] = {
+     { "connect",            "Connect socket",                                                   OFFSET(connect),         AV_OPT_TYPE_BOOL,   { .i64 =  0 },     0, 1,       .flags = D|E },
+     { "write_to_source",    "Send packets to the source address of the latest received packet", OFFSET(write_to_source), AV_OPT_TYPE_BOOL,   { .i64 =  0 },     0, 1,       .flags = D|E },
+     { "pkt_size",           "Maximum packet size",                                              OFFSET(pkt_size),        AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
++    { "reuse",              "explicitly allow reusing UDP sockets",                             OFFSET(reuse_socket),    AV_OPT_TYPE_BOOL,   { .i64 =  1 },     0, 1,       .flags = D|E },
+     { "dscp",               "DSCP class",                                                       OFFSET(dscp),            AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
+     { "timeout",            "set timeout (in microseconds) of socket I/O operations",           OFFSET(rw_timeout),      AV_OPT_TYPE_INT64,  { .i64 = -1 },    -1, INT64_MAX, .flags = D|E },
+     { "sources",            "Source list",                                                      OFFSET(sources),         AV_OPT_TYPE_STRING, { .str = NULL },               .flags = D|E },
+@@ -188,6 +190,8 @@ static void build_udp_url(RTPContext *s,
+         url_add_option(buf, buf_size, "buffer_size=%d", s->buffer_size);
+     if (s->pkt_size >= 0)
+         url_add_option(buf, buf_size, "pkt_size=%d", s->pkt_size);
++    if (s->reuse_socket >= 0)
++        url_add_option(buf, buf_size, "reuse=%d", s->reuse_socket);
+     if (s->connect)
+         url_add_option(buf, buf_size, "connect=1");
+     if (s->dscp >= 0)
+@@ -244,6 +248,13 @@ static int rtp_open(URLContext *h, const char *uri, int flags)
+ 
+     p = strchr(uri, '?');
+     if (p) {
++        if (av_find_info_tag(buf, sizeof(buf), "reuse", p)) {
++            char *endptr = NULL;
++            s->reuse_socket = strtol(buf, &endptr, 10);
++            /* assume if no digits were found it is a request to enable it */
++            if (buf == endptr)
++                s->reuse_socket = 1;
++        }
+         if (av_find_info_tag(buf, sizeof(buf), "ttl", p)) {
+             s->ttl = strtol(buf, NULL, 10);
+         }
+diff --git a/libavformat/rtsp.c b/libavformat/rtsp.c
+index 9a20481..454d3bd 100644
+--- a/libavformat/rtsp.c
++++ b/libavformat/rtsp.c
+@@ -79,6 +79,7 @@
+ #define COMMON_OPTS() \
+     { "reorder_queue_size", "set number of packets to buffer for handling of reordered packets", OFFSET(reordering_queue_size), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC }, \
+     { "buffer_size",        "Underlying protocol send/receive buffer size",                  OFFSET(buffer_size),           AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC|ENC }, \
++    { "jitter_delay",       "RTP jitter delay, in milliseconds",                             OFFSET(jitter_delay),          AV_OPT_TYPE_INT, { .i64 = 100 }, 100, INT_MAX, DEC }, \
+     { "pkt_size",           "Underlying protocol send packet size",                          OFFSET(pkt_size),              AV_OPT_TYPE_INT, { .i64 = 1472 }, -1, INT_MAX, ENC } \
+ 
+ 
+@@ -131,6 +132,7 @@ static AVDictionary *map_to_opts(RTSPState *rt)
+     AVDictionary *opts = NULL;
+ 
+     av_dict_set_int(&opts, "buffer_size", rt->buffer_size, 0);
++    av_dict_set_int(&opts, "jitter_delay", rt->jitter_delay, 0);
+     av_dict_set_int(&opts, "pkt_size",    rt->pkt_size,    0);
+     if (rt->localaddr && rt->localaddr[0])
+         av_dict_set(&opts, "localaddr", rt->localaddr, 0);
+@@ -868,6 +870,7 @@ int ff_rtsp_open_transport_ctx(AVFormatContext *s, RTSPStream *rtsp_st)
+     } else if (CONFIG_RTPDEC && rt->transport == RTSP_TRANSPORT_RTP &&
+                s->iformat) {
+         RTPDemuxContext *rtpctx = rtsp_st->transport_priv;
++        rtpctx->jitter_max = rt->jitter_delay * 1000;
+         rtpctx->ssrc = rtsp_st->ssrc;
+         if (rtsp_st->dynamic_handler) {
+             ff_rtp_parse_set_dynamic_protocol(rtsp_st->transport_priv,
+@@ -2267,6 +2270,11 @@ redo:
+         rt->transport == RTSP_TRANSPORT_RTP) {
+         av_log(s, AV_LOG_WARNING,
+                 "max delay reached. need to consume packet\n");
++        if (s->max_delay < rt->jitter_delay * 1000 + DEFAULT_REORDERING_DELAY / 2) {
++            s->max_delay += (DEFAULT_REORDERING_DELAY / 2);
++            av_log(s, AV_LOG_WARNING,
++                "increased max delay to %d\n", s->max_delay);
++        }
+         rtsp_st = first_queue_st;
+         ret = ff_rtp_parse_packet(rtsp_st->transport_priv, pkt, NULL, 0);
+         goto end;
+diff --git a/libavformat/rtsp.h b/libavformat/rtsp.h
+index 83b2e3f..cc9897c 100644
+--- a/libavformat/rtsp.h
++++ b/libavformat/rtsp.h
+@@ -417,6 +417,7 @@ typedef struct RTSPState {
+ 
+     char default_lang[4];
+     int buffer_size;
++    int jitter_delay;
+     int pkt_size;
+     char *localaddr;
+ } RTSPState;
+diff --git a/libavformat/udp.c b/libavformat/udp.c
+index d9514f5..ee551d9 100644
+--- a/libavformat/udp.c
++++ b/libavformat/udp.c
+@@ -84,6 +84,7 @@ typedef struct UDPContext {
+     int ttl;
+     int udplite_coverage;
+     int buffer_size;
++    int jitter_delay;
+     int pkt_size;
+     int is_multicast;
+     int is_broadcast;
+@@ -128,6 +129,7 @@ static const AVOption options[] = {
+     { "local_port",     "Local port",                                      OFFSET(local_port),     AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
+     { "localaddr",      "Local address",                                   OFFSET(localaddr),      AV_OPT_TYPE_STRING, { .str = NULL },               .flags = D|E },
+     { "udplite_coverage", "choose UDPLite head size which should be validated by checksum", OFFSET(udplite_coverage), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, D|E },
++    { "jitter_delay",   "RTP jitter delay, in milliseconds",               OFFSET(jitter_delay),   AV_OPT_TYPE_INT,    { .i64 = 100 },  100, INT_MAX, D }, \
+     { "pkt_size",       "Maximum UDP packet size",                         OFFSET(pkt_size),       AV_OPT_TYPE_INT,    { .i64 = 1472 },  -1, INT_MAX, .flags = D|E },
+     { "reuse",          "explicitly allow reusing UDP sockets",            OFFSET(reuse_socket),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,       D|E },
+     { "reuse_socket",   "explicitly allow reusing UDP sockets",            OFFSET(reuse_socket),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,       .flags = D|E },
+diff --git a/libavformat/version_major.h b/libavformat/version_major.h
+index 44ad23c..282047f 100644
+--- a/libavformat/version_major.h
++++ b/libavformat/version_major.h
+@@ -41,7 +41,7 @@
+  * at once through the bump. This improves the git bisect-ability of the change.
+  *
+  */
+-#define FF_API_COMPUTE_PKT_FIELDS2      (LIBAVFORMAT_VERSION_MAJOR < 62)
++#define FF_API_COMPUTE_PKT_FIELDS2      0
+ #define FF_API_LAVF_SHORTEST            (LIBAVFORMAT_VERSION_MAJOR < 62)
+ #define FF_API_ALLOW_FLUSH              (LIBAVFORMAT_VERSION_MAJOR < 62)
+ #define FF_API_AVSTREAM_SIDE_DATA       (LIBAVFORMAT_VERSION_MAJOR < 62)
